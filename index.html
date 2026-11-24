@@ -1,0 +1,536 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Pongo</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #071018;
+      --court: #0c1c28;
+      --text: #e8fff6;
+      --muted: #8fb8aa;
+    }
+
+    * { box-sizing: border-box; }
+
+    html, body {
+      margin: 0;
+      height: 100%;
+      background:
+        radial-gradient(ellipse at 50% 0%, #123044 0%, var(--bg) 55%);
+      color: var(--text);
+      font-family: "Segoe UI", system-ui, sans-serif;
+    }
+
+    body {
+      min-height: 100%;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 16px;
+      padding: 24px;
+    }
+
+    h1 {
+      margin: 0;
+      font-size: 28px;
+      letter-spacing: 0.28em;
+      font-weight: 650;
+    }
+
+    .help {
+      margin: 0;
+      color: var(--muted);
+      font-size: 15px;
+      text-align: center;
+      line-height: 1.5;
+    }
+
+    .help strong { color: var(--text); font-weight: 650; }
+
+    .stage {
+      width: min(960px, 100%);
+      background: #061018;
+      border: 1px solid rgba(186, 230, 214, 0.18);
+      border-radius: 16px;
+      box-shadow: 0 24px 60px rgba(0, 0, 0, 0.35);
+      overflow: hidden;
+    }
+
+    canvas {
+      display: block;
+      width: 100%;
+      height: auto;
+      background: var(--court);
+    }
+  </style>
+</head>
+<body>
+  <h1>PONGO</h1>
+  <p class="help">Left paddle <strong>W</strong> / <strong>S</strong> &nbsp;·&nbsp; Right paddle <strong>↑</strong> / <strong>↓</strong> &nbsp;·&nbsp; First to 7 &nbsp;·&nbsp; <strong>Space</strong> to serve</p>
+  <div class="stage">
+    <canvas id="court" width="960" height="540"></canvas>
+  </div>
+
+  <script>
+    const canvas = document.getElementById("court");
+    const ctx = canvas.getContext("2d");
+
+    const COURT = { w: 960, h: 540 };
+    const PADDLE = { w: 14, h: 100, speed: 480, inset: 28 };
+    const BALL = { r: 9, serveSpeed: 420, maxSpeed: 760 };
+    const WIN_SCORE = 7;
+    const SHARD = { cols: 2, rows: 10 };
+    const COLORS = {
+      left: [94, 234, 212],
+      right: [251, 113, 133]
+    };
+
+    const keys = new Set();
+    const state = {
+      leftY: (COURT.h - PADDLE.h) / 2,
+      rightY: (COURT.h - PADDLE.h) / 2,
+      ballX: COURT.w / 2,
+      ballY: COURT.h / 2,
+      ballVx: 0,
+      ballVy: 0,
+      scoreL: 0,
+      scoreR: 0,
+      mode: "serve",
+      serveTo: 1,
+      message: "Press Space to serve",
+      pieces: null,
+      brokenSide: null,
+      reformStill: 0
+    };
+
+    const audio = {
+      ctx: null,
+      ensure() {
+        const Ctx = window.AudioContext || window.webkitAudioContext;
+        if (!Ctx) return null;
+        if (!this.ctx) this.ctx = new Ctx();
+        if (this.ctx.state === "suspended") this.ctx.resume();
+        return this.ctx;
+      },
+      beep(freq, ms, gainValue) {
+        const actx = this.ensure();
+        if (!actx) return;
+        const osc = actx.createOscillator();
+        const gain = actx.createGain();
+        osc.frequency.value = freq;
+        osc.type = "square";
+        gain.gain.value = gainValue;
+        osc.connect(gain);
+        gain.connect(actx.destination);
+        osc.start();
+        gain.gain.exponentialRampToValueAtTime(0.0001, actx.currentTime + ms / 1000);
+        osc.stop(actx.currentTime + ms / 1000);
+      },
+      crack() {
+        const actx = this.ensure();
+        if (!actx) return;
+        const duration = 0.22;
+        const buffer = actx.createBuffer(1, Math.floor(actx.sampleRate * duration), actx.sampleRate);
+        const data = buffer.getChannelData(0);
+        for (let i = 0; i < data.length; i++) {
+          const fade = Math.pow(1 - i / data.length, 1.6);
+          data[i] = (Math.random() * 2 - 1) * fade;
+        }
+        const source = actx.createBufferSource();
+        source.buffer = buffer;
+        const filter = actx.createBiquadFilter();
+        filter.type = "bandpass";
+        filter.frequency.value = 1400;
+        filter.Q.value = 0.7;
+        const gain = actx.createGain();
+        gain.gain.value = 0.35;
+        source.connect(filter);
+        filter.connect(gain);
+        gain.connect(actx.destination);
+        source.start();
+      }
+    };
+
+    function placeBall() {
+      state.ballX = COURT.w / 2;
+      state.ballY = COURT.h / 2;
+      state.ballVx = 0;
+      state.ballVy = 0;
+    }
+
+    function serve() {
+      if (state.mode === "over") {
+        state.scoreL = 0;
+        state.scoreR = 0;
+      }
+      const angle = (Math.random() * 0.7 - 0.35);
+      state.ballX = COURT.w / 2;
+      state.ballY = COURT.h / 2;
+      state.ballVx = Math.cos(angle) * BALL.serveSpeed * state.serveTo;
+      state.ballVy = Math.sin(angle) * BALL.serveSpeed;
+      state.mode = "play";
+      state.message = "";
+      audio.beep(440, 70, 0.03);
+    }
+
+    function paddleX(side) {
+      return side === "left"
+        ? PADDLE.inset
+        : COURT.w - PADDLE.inset - PADDLE.w;
+    }
+
+    function paddleY(side) {
+      return side === "left" ? state.leftY : state.rightY;
+    }
+
+    function shatter(side) {
+      const x0 = paddleX(side);
+      const y0 = paddleY(side);
+      const shardW = PADDLE.w / SHARD.cols;
+      const shardH = PADDLE.h / SHARD.rows;
+      const originX = side === "left" ? x0 - 6 : x0 + PADDLE.w + 6;
+      const originY = clamp(state.ballY, y0 + 4, y0 + PADDLE.h - 4);
+      const pieces = [];
+
+      for (let row = 0; row < SHARD.rows; row++) {
+        for (let col = 0; col < SHARD.cols; col++) {
+          const homeX = col * shardW;
+          const homeY = row * shardH;
+          const x = x0 + homeX;
+          const y = y0 + homeY;
+          const cx = x + shardW / 2;
+          const cy = y + shardH / 2;
+          const dx = cx - originX;
+          const dy = cy - originY;
+          const mag = Math.hypot(dx, dy) || 1;
+          const power = 260 + Math.random() * 340;
+          pieces.push({
+            homeX,
+            homeY,
+            x,
+            y,
+            w: Math.max(2, shardW - 1.4),
+            h: Math.max(2, shardH - 1.4),
+            vx: (dx / mag) * power + (Math.random() - 0.5) * 80,
+            vy: (dy / mag) * power - 90 + (Math.random() - 0.5) * 80,
+            rot: (Math.random() - 0.5) * 0.4,
+            vr: (Math.random() - 0.5) * 16,
+            tone: 0.78 + Math.random() * 0.4
+          });
+        }
+      }
+      return pieces;
+    }
+
+    function score(scoringSide) {
+      const loser = scoringSide === "left" ? "right" : "left";
+      state.pieces = shatter(loser);
+      state.brokenSide = loser;
+      state.reformStill = 0;
+      if (scoringSide === "left") state.scoreL += 1;
+      else state.scoreR += 1;
+      audio.beep(180, 140, 0.04);
+      audio.crack();
+      const winner =
+        state.scoreL >= WIN_SCORE ? "Left player wins" :
+        state.scoreR >= WIN_SCORE ? "Right player wins" :
+        null;
+      placeBall();
+      state.serveTo = scoringSide === "left" ? -1 : 1;
+      if (winner) {
+        state.mode = "over";
+        state.message = winner + " — Space for a new game";
+      } else {
+        state.mode = "broken";
+        state.message = "Press Space to serve";
+      }
+    }
+
+    function beginReform() {
+      if (state.mode === "over") {
+        state.scoreL = 0;
+        state.scoreR = 0;
+      }
+      state.mode = "reform";
+      state.message = "";
+      state.reformStill = 0;
+      audio.beep(300, 90, 0.03);
+    }
+
+    function clamp(value, min, max) {
+      return Math.max(min, Math.min(max, value));
+    }
+
+    function movePaddle(y, direction, dt) {
+      return clamp(y + direction * PADDLE.speed * dt, 0, COURT.h - PADDLE.h);
+    }
+
+    function bounceOffPaddle(paddleXPos, paddleYPos, direction) {
+      const center = paddleYPos + PADDLE.h / 2;
+      const offset = clamp((state.ballY - center) / (PADDLE.h / 2), -1, 1);
+      const speed = Math.min(BALL.maxSpeed, Math.hypot(state.ballVx, state.ballVy) * 1.06);
+      const angle = offset * (Math.PI / 3);
+      state.ballVx = Math.cos(angle) * speed * direction;
+      state.ballVy = Math.sin(angle) * speed;
+      state.ballX = direction > 0
+        ? paddleXPos + PADDLE.w + BALL.r
+        : paddleXPos - BALL.r;
+      audio.beep(620, 40, 0.025);
+    }
+
+    function hitsPaddle(paddleXPos, paddleYPos) {
+      const nearestX = clamp(state.ballX, paddleXPos, paddleXPos + PADDLE.w);
+      const nearestY = clamp(state.ballY, paddleYPos, paddleYPos + PADDLE.h);
+      const dx = state.ballX - nearestX;
+      const dy = state.ballY - nearestY;
+      return dx * dx + dy * dy <= BALL.r * BALL.r;
+    }
+
+    function bouncePiece(piece, axis) {
+      if (axis === "x") piece.vx *= -0.52;
+      else piece.vy *= -0.42;
+      piece.vr += (Math.random() - 0.5) * 6;
+      piece.vr *= 0.85;
+    }
+
+    function containPiece(piece) {
+      if (piece.x < 2) {
+        piece.x = 2;
+        if (piece.vx < 0) bouncePiece(piece, "x");
+      } else if (piece.x + piece.w > COURT.w - 2) {
+        piece.x = COURT.w - 2 - piece.w;
+        if (piece.vx > 0) bouncePiece(piece, "x");
+      }
+      if (piece.y < 2) {
+        piece.y = 2;
+        if (piece.vy < 0) bouncePiece(piece, "y");
+      } else if (piece.y + piece.h > COURT.h - 2) {
+        piece.y = COURT.h - 2 - piece.h;
+        if (piece.vy > 0) bouncePiece(piece, "y");
+        piece.vx *= 0.86;
+      }
+    }
+
+    function collidePieces(pieces) {
+      for (let i = 0; i < pieces.length; i++) {
+        for (let j = i + 1; j < pieces.length; j++) {
+          const a = pieces[i];
+          const b = pieces[j];
+          const ax = a.x + a.w / 2;
+          const ay = a.y + a.h / 2;
+          const bx = b.x + b.w / 2;
+          const by = b.y + b.h / 2;
+          let dx = bx - ax;
+          let dy = by - ay;
+          const minDist = (Math.min(a.w, a.h) + Math.min(b.w, b.h)) * 0.55;
+          const dist = Math.hypot(dx, dy) || 0.0001;
+          if (dist >= minDist) continue;
+          const nx = dx / dist;
+          const ny = dy / dist;
+          const overlap = minDist - dist;
+          a.x -= nx * overlap * 0.5;
+          a.y -= ny * overlap * 0.5;
+          b.x += nx * overlap * 0.5;
+          b.y += ny * overlap * 0.5;
+          const rel = (b.vx - a.vx) * nx + (b.vy - a.vy) * ny;
+          if (rel >= 0) continue;
+          const impulse = rel * 0.65;
+          a.vx += nx * impulse;
+          a.vy += ny * impulse;
+          b.vx -= nx * impulse;
+          b.vy -= ny * impulse;
+          a.vr += (Math.random() - 0.5) * 2;
+          b.vr += (Math.random() - 0.5) * 2;
+        }
+      }
+    }
+
+    function updatePieces(dt) {
+      const pieces = state.pieces;
+      if (!pieces) return;
+      const reforming = state.mode === "reform";
+      const originX = state.brokenSide ? paddleX(state.brokenSide) : 0;
+      const originY = state.brokenSide ? paddleY(state.brokenSide) : 0;
+      let worst = 0;
+
+      for (const piece of pieces) {
+        if (reforming) {
+          const targetX = originX + piece.homeX + (PADDLE.w / SHARD.cols - piece.w) / 2;
+          const targetY = originY + piece.homeY + (PADDLE.h / SHARD.rows - piece.h) / 2;
+          const k = 78;
+          const damp = 11;
+          piece.vx += ((targetX - piece.x) * k - piece.vx * damp) * dt;
+          piece.vy += ((targetY - piece.y) * k - piece.vy * damp) * dt;
+          piece.vr += (-piece.rot * 64 - piece.vr * 10) * dt;
+          worst = Math.max(worst, Math.hypot(targetX - piece.x, targetY - piece.y), Math.abs(piece.rot));
+        } else {
+          piece.vy += 980 * dt;
+        }
+
+        piece.x += piece.vx * dt;
+        piece.y += piece.vy * dt;
+        piece.rot += piece.vr * dt;
+        if (!reforming) containPiece(piece);
+      }
+
+      if (!reforming) collidePieces(pieces);
+
+      if (reforming) {
+        state.reformStill = worst < 2.2 ? state.reformStill + dt : 0;
+        if (state.reformStill > 0.12) {
+          state.pieces = null;
+          state.brokenSide = null;
+          state.reformStill = 0;
+          serve();
+        }
+      }
+    }
+
+    function update(dt) {
+      const leftDir = (keys.has("KeyS") ? 1 : 0) - (keys.has("KeyW") ? 1 : 0);
+      const rightDir = (keys.has("ArrowDown") ? 1 : 0) - (keys.has("ArrowUp") ? 1 : 0);
+      state.leftY = movePaddle(state.leftY, leftDir, dt);
+      state.rightY = movePaddle(state.rightY, rightDir, dt);
+      updatePieces(dt);
+      if (state.mode !== "play") return;
+
+      state.ballX += state.ballVx * dt;
+      state.ballY += state.ballVy * dt;
+
+      if (state.ballY - BALL.r <= 0) {
+        state.ballY = BALL.r;
+        state.ballVy = Math.abs(state.ballVy);
+        audio.beep(520, 30, 0.02);
+      } else if (state.ballY + BALL.r >= COURT.h) {
+        state.ballY = COURT.h - BALL.r;
+        state.ballVy = -Math.abs(state.ballVy);
+        audio.beep(520, 30, 0.02);
+      }
+
+      const leftX = PADDLE.inset;
+      const rightX = COURT.w - PADDLE.inset - PADDLE.w;
+      if (state.ballVx < 0 && hitsPaddle(leftX, state.leftY)) {
+        bounceOffPaddle(leftX, state.leftY, 1);
+      } else if (state.ballVx > 0 && hitsPaddle(rightX, state.rightY)) {
+        bounceOffPaddle(rightX, state.rightY, -1);
+      }
+
+      if (state.ballX + BALL.r < 0) score("right");
+      else if (state.ballX - BALL.r > COURT.w) score("left");
+    }
+
+    function drawCenterLine() {
+      ctx.strokeStyle = "rgba(186, 230, 214, 0.35)";
+      ctx.lineWidth = 4;
+      ctx.setLineDash([14, 16]);
+      ctx.beginPath();
+      ctx.moveTo(COURT.w / 2, 24);
+      ctx.lineTo(COURT.w / 2, COURT.h - 24);
+      ctx.stroke();
+      ctx.setLineDash([]);
+    }
+
+    function drawPaddle(x, y, color) {
+      ctx.fillStyle = color;
+      ctx.shadowColor = color;
+      ctx.shadowBlur = 18;
+      ctx.beginPath();
+      ctx.roundRect(x, y, PADDLE.w, PADDLE.h, 7);
+      ctx.fill();
+      ctx.shadowBlur = 0;
+    }
+
+    function pieceColor(side, tone) {
+      const [r, g, b] = COLORS[side];
+      return "rgb(" + Math.round(r * tone) + "," + Math.round(g * tone) + "," + Math.round(b * tone) + ")";
+    }
+
+    function drawPieces() {
+      if (!state.pieces || !state.brokenSide) return;
+      const colorSide = state.brokenSide;
+      for (const piece of state.pieces) {
+        ctx.save();
+        ctx.translate(piece.x + piece.w / 2, piece.y + piece.h / 2);
+        ctx.rotate(piece.rot);
+        ctx.fillStyle = pieceColor(colorSide, piece.tone);
+        ctx.shadowColor = ctx.fillStyle;
+        ctx.shadowBlur = 10;
+        ctx.beginPath();
+        ctx.roundRect(-piece.w / 2, -piece.h / 2, piece.w, piece.h, 2);
+        ctx.fill();
+        ctx.restore();
+      }
+      ctx.shadowBlur = 0;
+    }
+
+    function draw() {
+      ctx.clearRect(0, 0, COURT.w, COURT.h);
+      drawCenterLine();
+
+      ctx.fillStyle = "#e8fff6";
+      ctx.font = "64px Segoe UI, system-ui, sans-serif";
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      ctx.globalAlpha = 0.9;
+      ctx.fillText(String(state.scoreL), COURT.w * 0.25, 72);
+      ctx.fillText(String(state.scoreR), COURT.w * 0.75, 72);
+      ctx.globalAlpha = 1;
+
+      if (state.brokenSide !== "left") drawPaddle(PADDLE.inset, state.leftY, "#5eead4");
+      if (state.brokenSide !== "right") {
+        drawPaddle(COURT.w - PADDLE.inset - PADDLE.w, state.rightY, "#fb7185");
+      }
+      drawPieces();
+
+      ctx.fillStyle = "#f8fafc";
+      ctx.shadowColor = "#f8fafc";
+      ctx.shadowBlur = 16;
+      ctx.beginPath();
+      ctx.arc(state.ballX, state.ballY, BALL.r, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.shadowBlur = 0;
+
+      if (state.message) {
+        ctx.fillStyle = "rgba(6, 16, 24, 0.55)";
+        ctx.fillRect(0, COURT.h / 2 - 36, COURT.w, 72);
+        ctx.fillStyle = "#e8fff6";
+        ctx.font = "28px Segoe UI, system-ui, sans-serif";
+        ctx.fillText(state.message, COURT.w / 2, COURT.h / 2);
+      }
+    }
+
+    window.addEventListener("keydown", (event) => {
+      const used = ["KeyW", "KeyS", "ArrowUp", "ArrowDown", "Space"];
+      if (!used.includes(event.code)) return;
+      event.preventDefault();
+      keys.add(event.code);
+      if (event.code !== "Space" || state.mode === "play" || state.mode === "reform") return;
+      if (state.pieces) beginReform();
+      else serve();
+    });
+
+    window.addEventListener("keyup", (event) => {
+      keys.delete(event.code);
+    });
+
+    window.addEventListener("blur", () => keys.clear());
+
+    let last = performance.now();
+    function frame(now) {
+      const dt = Math.min(0.032, (now - last) / 1000);
+      last = now;
+      update(dt);
+      draw();
+      requestAnimationFrame(frame);
+    }
+
+    placeBall();
+    draw();
+    requestAnimationFrame(frame);
+  </script>
+</body>
+</html>
